@@ -163,14 +163,15 @@ private <T> void doRegisterBean(Class<T> beanClass, @Nullable String name,
     if (this.conditionEvaluator.shouldSkip(abd.getMetadata())) {
         return;
     }
-
     abd.setAttribute(ConfigurationClassUtils.CANDIDATE_ATTRIBUTE, Boolean.TRUE);
     abd.setInstanceSupplier(supplier);
+    //解析@Scope注解，获取Scope注解的元数据
     ScopeMetadata scopeMetadata = this.scopeMetadataResolver.resolveScopeMetadata(abd);
     abd.setScope(scopeMetadata.getScopeName());
     String beanName = (name != null ? name : this.beanNameGenerator.generateBeanName(abd, this.registry));
-	//处理通用注解
+	//处理通用注解，下面有详细的解释
     AnnotationConfigUtils.processCommonDefinitionAnnotations(abd);
+    //对qualifiers注解的处理，如果存在，则根据注解类型分别设置primary、lazyInit标志，或者添加额外的qualifier
     if (qualifiers != null) {
         for (Class<? extends Annotation> qualifier : qualifiers) {
             if (Primary.class == qualifier) {
@@ -184,14 +185,17 @@ private <T> void doRegisterBean(Class<T> beanClass, @Nullable String name,
             }
         }
     }
+    //如果有定制器customizers，则循环调用它们的customize方法，允许进一步修改bean定义
     if (customizers != null) {
         for (BeanDefinitionCustomizer customizer : customizers) {
             customizer.customize(abd);
         }
     }
-
+	//创建一个BeanDefinitionHolder，它包含了bean定义和名字
     BeanDefinitionHolder definitionHolder = new BeanDefinitionHolder(abd, beanName);
+    //根据bean的scope（作用域）来决定是否以及如何创建代理对象
     definitionHolder = AnnotationConfigUtils.applyScopedProxyMode(scopeMetadata, definitionHolder, this.registry);
+    //将bean定义注册到bean工厂中
     BeanDefinitionReaderUtils.registerBeanDefinition(definitionHolder, this.registry);
 }
 
@@ -286,7 +290,31 @@ static void processCommonDefinitionAnnotations(AnnotatedBeanDefinition abd, Anno
 }
 ```
 
+最后的Bean定义注册到Bean工厂：
 
+```java
+public static void registerBeanDefinition(
+    BeanDefinitionHolder definitionHolder, BeanDefinitionRegistry registry)
+    throws BeanDefinitionStoreException {
+
+    //注册Bean定义
+    String beanName = definitionHolder.getBeanName();
+    registry.registerBeanDefinition(beanName, definitionHolder.getBeanDefinition());
+
+    //注册Bean别名
+    String[] aliases = definitionHolder.getAliases();
+    if (aliases != null) {
+        for (String alias : aliases) {
+            registry.registerAlias(beanName, alias);
+        }
+    }
+}
+//跳转到GenericApplicationContext的registerBeanDefinition方法
+public void registerBeanDefinition(String beanName, BeanDefinition beanDefinition)
+    throws BeanDefinitionStoreException {
+    this.beanFactory.registerBeanDefinition(beanName, beanDefinition);
+}
+```
 
 #### 二、加载资源文件
 
@@ -305,6 +333,48 @@ private void load(Resource source) {
     }
 }
 ```
+
+主要是xmlReader的loadBeanDefinitions方法，该方法实际上是将原来老版本中读取XML配置文件的代码基本复制过来：
+
+```java
+public int loadBeanDefinitions(EncodedResource encodedResource) throws BeanDefinitionStoreException {
+    Assert.notNull(encodedResource, "EncodedResource must not be null");
+    if (logger.isTraceEnabled()) {
+        logger.trace("Loading XML bean definitions from " + encodedResource);
+    }
+
+    Set<EncodedResource> currentResources = this.resourcesCurrentlyBeingLoaded.get();
+
+    if (!currentResources.add(encodedResource)) {
+        throw new BeanDefinitionStoreException(
+            "Detected cyclic loading of " + encodedResource + " - check your import definitions!");
+    }
+	//读取资源流
+    try (InputStream inputStream = encodedResource.getResource().getInputStream()) {
+        InputSource inputSource = new InputSource(inputStream);
+        //如果EncodedResource指定了编码，也一并设置到InputSource中
+        if (encodedResource.getEncoding() != null) {
+            inputSource.setEncoding(encodedResource.getEncoding());
+        }
+        //实际Bean定义加载
+        return doLoadBeanDefinitions(inputSource, encodedResource.getResource());
+    }
+    catch (IOException ex) {
+        throw new BeanDefinitionStoreException(
+            "IOException parsing XML document from " + encodedResource.getResource(), ex);
+    }
+    finally {
+        //无论是否发生异常，都将当前EncodedResource从Set中移除
+        currentResources.remove(encodedResource);
+        //释放资源并避免内存泄漏
+        if (currentResources.isEmpty()) {
+            this.resourcesCurrentlyBeingLoaded.remove();
+        }
+    }
+}
+```
+
+由于现有SpringBoot实现了约定大于配置，现在都很少使用xml文件来进行配置，所以这块内容就不详细讲解了。
 
 #### 三、加载包文件
 
@@ -337,7 +407,9 @@ public int scan(String... basePackages) {
 protected Set<BeanDefinitionHolder> doScan(String... basePackages) {
     Assert.notEmpty(basePackages, "At least one base package must be specified");
     Set<BeanDefinitionHolder> beanDefinitions = new LinkedHashSet<>();
+    //对包进行遍历操作
     for (String basePackage : basePackages) {
+        //从包路径下查找候选组件
         Set<BeanDefinition> candidates = findCandidateComponents(basePackage);
         for (BeanDefinition candidate : candidates) {
             ScopeMetadata scopeMetadata = this.scopeMetadataResolver.resolveScopeMetadata(candidate);
@@ -362,6 +434,137 @@ protected Set<BeanDefinitionHolder> doScan(String... basePackages) {
 }
 ```
 
+findCandidateComponents是查找候选组件方法：
+
+```java
+//这段代码决定是使用已有的索引快速查找候选组件还是重新扫描整个包来发现可能的组件
+public Set<BeanDefinition> findCandidateComponents(String basePackage) {
+    //组件索引是否为空，并且索引是否支持包含过滤器
+    if (this.componentsIndex != null && indexSupportsIncludeFilters()) {
+        //从索引中添加候选组件，这样会提升性能（之前已经进行过一次扫描，并且结果被缓存了，现在可以直接使用索引来查找组件，从而提高性能）
+        return addCandidateComponentsFromIndex(this.componentsIndex, basePackage);
+    }
+    else {
+        return scanCandidateComponents(basePackage);
+    }
+}
+
+private Set<BeanDefinition> addCandidateComponentsFromIndex(CandidateComponentsIndex index, String basePackage) {
+    Set<BeanDefinition> candidates = new LinkedHashSet<>();
+    try {
+        Set<String> types = new HashSet<>();
+        for (TypeFilter filter : this.includeFilters) {
+            String stereotype = extractStereotype(filter);
+            if (stereotype == null) {
+                throw new IllegalArgumentException("Failed to extract stereotype from " + filter);
+            }
+            types.addAll(index.getCandidateTypes(basePackage, stereotype));
+        }
+        boolean traceEnabled = logger.isTraceEnabled();
+        boolean debugEnabled = logger.isDebugEnabled();
+        for (String type : types) {
+            MetadataReader metadataReader = getMetadataReaderFactory().getMetadataReader(type);
+            if (isCandidateComponent(metadataReader)) {
+                ScannedGenericBeanDefinition sbd = new ScannedGenericBeanDefinition(metadataReader);
+                sbd.setSource(metadataReader.getResource());
+                if (isCandidateComponent(sbd)) {
+                    if (debugEnabled) {
+                        logger.debug("Using candidate component class from index: " + type);
+                    }
+                    candidates.add(sbd);
+                }
+                else {
+                    if (debugEnabled) {
+                        logger.debug("Ignored because not a concrete top-level class: " + type);
+                    }
+                }
+            }
+            else {
+                if (traceEnabled) {
+                    logger.trace("Ignored because matching an exclude filter: " + type);
+                }
+            }
+        }
+    }
+    catch (IOException ex) {
+        throw new BeanDefinitionStoreException("I/O failure during classpath scanning", ex);
+    }
+    return candidates;
+}
+
+private Set<BeanDefinition> scanCandidateComponents(String basePackage) {
+    Set<BeanDefinition> candidates = new LinkedHashSet<>();
+    try {
+        //转换basePackage路径，比如classpath*:com/example/sprintboottest/**/*.class
+        String packageSearchPath = ResourcePatternResolver.CLASSPATH_ALL_URL_PREFIX +
+            resolveBasePackage(basePackage) + '/' + this.resourcePattern;
+        //找到所有匹配的资源，都转换成实际的路径
+        Resource[] resources = getResourcePatternResolver().getResources(packageSearchPath);
+        boolean traceEnabled = logger.isTraceEnabled();
+        boolean debugEnabled = logger.isDebugEnabled();
+        for (Resource resource : resources) {
+            //获取资源文件名
+            String filename = resource.getFilename();
+            //判断文件名是否包含“$$”，包含这个符号的是CGLIB生成的类，直接跳过
+            if (filename != null && filename.contains(ClassUtils.CGLIB_CLASS_SEPARATOR)) {
+                // Ignore CGLIB-generated classes in the classpath
+                continue;
+            }
+            if (traceEnabled) {
+                logger.trace("Scanning " + resource);
+            }
+            try {
+                MetadataReader metadataReader = getMetadataReaderFactory().getMetadataReader(resource);
+                if (isCandidateComponent(metadataReader)) {
+                    ScannedGenericBeanDefinition sbd = new ScannedGenericBeanDefinition(metadataReader);
+                    sbd.setSource(resource);
+                    if (isCandidateComponent(sbd)) {
+                        if (debugEnabled) {
+                            logger.debug("Identified candidate component class: " + resource);
+                        }
+                        candidates.add(sbd);
+                    }
+                    else {
+                        if (debugEnabled) {
+                            logger.debug("Ignored because not a concrete top-level class: " + resource);
+                        }
+                    }
+                }
+                else {
+                    if (traceEnabled) {
+                        logger.trace("Ignored because not matching any filter: " + resource);
+                    }
+                }
+            }
+            catch (FileNotFoundException ex) {
+                if (traceEnabled) {
+                    logger.trace("Ignored non-readable " + resource + ": " + ex.getMessage());
+                }
+            }
+            catch (ClassFormatException ex) {
+                if (shouldIgnoreClassFormatException) {
+                    if (debugEnabled) {
+                        logger.debug("Ignored incompatible class format in " + resource + ": " + ex.getMessage());
+                    }
+                }
+                else {
+                    throw new BeanDefinitionStoreException("Incompatible class format in " + resource +
+                                                           ": set system property 'spring.classformat.ignore' to 'true' " +
+                                                           "if you mean to ignore such files during classpath scanning", ex);
+                }
+            }
+            catch (Throwable ex) {
+                throw new BeanDefinitionStoreException("Failed to read candidate component class: " + resource, ex);
+            }
+        }
+    }
+    catch (IOException ex) {
+        throw new BeanDefinitionStoreException("I/O failure during classpath scanning", ex);
+    }
+    return candidates;
+}
+```
+
 registerAnnotationConfigProcessors方法用来注册相关注解后置处理器：
 
 ```java
@@ -371,7 +574,7 @@ public static void registerAnnotationConfigProcessors(BeanDefinitionRegistry reg
 
 public static Set<BeanDefinitionHolder> registerAnnotationConfigProcessors(
     BeanDefinitionRegistry registry, @Nullable Object source) {
-
+//检查并配置beanFactory的依赖比较器（DependencyComparator）和自动装配候选解析器（AutowireCandidateResolver），确保它们能够正确处理注解信息
     DefaultListableBeanFactory beanFactory = unwrapDefaultListableBeanFactory(registry);
     if (beanFactory != null) {
         if (!(beanFactory.getDependencyComparator() instanceof AnnotationAwareOrderComparator)) {
@@ -381,22 +584,22 @@ public static Set<BeanDefinitionHolder> registerAnnotationConfigProcessors(
             beanFactory.setAutowireCandidateResolver(new ContextAnnotationAutowireCandidateResolver());
         }
     }
-
+	//创建并注册一系列的Bean后置处理器，每个处理器都对应不同的注解处理需求
     Set<BeanDefinitionHolder> beanDefs = new LinkedHashSet<>(8);
-
+	//用于处理@Configuration类，帮助解析配置类上的@Bean方法
     if (!registry.containsBeanDefinition(CONFIGURATION_ANNOTATION_PROCESSOR_BEAN_NAME)) {
         RootBeanDefinition def = new RootBeanDefinition(ConfigurationClassPostProcessor.class);
         def.setSource(source);
         beanDefs.add(registerPostProcessor(registry, def, CONFIGURATION_ANNOTATION_PROCESSOR_BEAN_NAME));
     }
-
+	//用于处理@Autowired注解，自动装配依赖项
     if (!registry.containsBeanDefinition(AUTOWIRED_ANNOTATION_PROCESSOR_BEAN_NAME)) {
         RootBeanDefinition def = new RootBeanDefinition(AutowiredAnnotationBeanPostProcessor.class);
         def.setSource(source);
         beanDefs.add(registerPostProcessor(registry, def, AUTOWIRED_ANNOTATION_PROCESSOR_BEAN_NAME));
     }
 
-    // Check for Jakarta Annotations support, and if present add the CommonAnnotationBeanPostProcessor.
+    //用于处理JSR-250标准中的@Resource等注解，如果相关类库存在的话
     if ((jakartaAnnotationsPresent || jsr250Present) &&
         !registry.containsBeanDefinition(COMMON_ANNOTATION_PROCESSOR_BEAN_NAME)) {
         RootBeanDefinition def = new RootBeanDefinition(CommonAnnotationBeanPostProcessor.class);
@@ -404,7 +607,7 @@ public static Set<BeanDefinitionHolder> registerAnnotationConfigProcessors(
         beanDefs.add(registerPostProcessor(registry, def, COMMON_ANNOTATION_PROCESSOR_BEAN_NAME));
     }
 
-    // Check for JPA support, and if present add the PersistenceAnnotationBeanPostProcessor.
+    //用于处理JPA相关的注解，如@Entity、@Repository等，如果JPA类库存在的话
     if (jpaPresent && !registry.containsBeanDefinition(PERSISTENCE_ANNOTATION_PROCESSOR_BEAN_NAME)) {
         RootBeanDefinition def = new RootBeanDefinition();
         try {
@@ -418,13 +621,13 @@ public static Set<BeanDefinitionHolder> registerAnnotationConfigProcessors(
         def.setSource(source);
         beanDefs.add(registerPostProcessor(registry, def, PERSISTENCE_ANNOTATION_PROCESSOR_BEAN_NAME));
     }
-
+	//用于处理事件监听注解，如@EventListener
     if (!registry.containsBeanDefinition(EVENT_LISTENER_PROCESSOR_BEAN_NAME)) {
         RootBeanDefinition def = new RootBeanDefinition(EventListenerMethodProcessor.class);
         def.setSource(source);
         beanDefs.add(registerPostProcessor(registry, def, EVENT_LISTENER_PROCESSOR_BEAN_NAME));
     }
-
+	//用于创建事件监听器工厂
     if (!registry.containsBeanDefinition(EVENT_LISTENER_FACTORY_BEAN_NAME)) {
         RootBeanDefinition def = new RootBeanDefinition(DefaultEventListenerFactory.class);
         def.setSource(source);
@@ -432,14 +635,6 @@ public static Set<BeanDefinitionHolder> registerAnnotationConfigProcessors(
     }
 
     return beanDefs;
-}
-
-private static BeanDefinitionHolder registerPostProcessor(
-    BeanDefinitionRegistry registry, RootBeanDefinition definition, String beanName) {
-
-    definition.setRole(BeanDefinition.ROLE_INFRASTRUCTURE);
-    registry.registerBeanDefinition(beanName, definition);
-    return new BeanDefinitionHolder(definition, beanName);
 }
 ```
 
